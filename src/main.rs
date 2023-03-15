@@ -68,9 +68,8 @@ impl App {
         // `cc.egui_ctx.set_visuals` and `cc.egui_ctx.set_fonts`.
         cc.egui_ctx.set_visuals(egui::Visuals::light());
         let mut fonts = FontDefinitions::default();
-        // TODO: is this font legal?
-        fonts.font_data.insert("pingfang".to_owned(), FontData::from_static(include_bytes!("/System/Library/Fonts/PingFang.ttc")));
-        fonts.families.get_mut(&FontFamily::Proportional).unwrap().insert(0, "pingfang".to_owned());
+        fonts.font_data.insert("SourceHan".to_owned(), FontData::from_static(include_bytes!("../resources/SourceHanSansCN-Normal.otf")));
+        fonts.families.get_mut(&FontFamily::Proportional).unwrap().insert(0, "SourceHan".to_owned());
         cc.egui_ctx.set_fonts(fonts);
 
         // Load previous app state (if any).
@@ -143,16 +142,6 @@ impl eframe::App for App {
                     }
                     ui.label(self.display_path());
                 });
-
-                egui::ComboBox::from_id_source("combo")
-                    .selected_text(self.sound)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.sound, "a", "1");
-                        ui.selectable_value(&mut self.sound, "b", "2");
-                        ui.selectable_value(&mut self.sound, "c", "3");
-                    })
-                ;
-
 
                 ui.horizontal(|ui| {
                     if ui.button("play").clicked() {
