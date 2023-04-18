@@ -10,6 +10,7 @@ rodio = "0.17"
 rand = "0.8"
 aws-config = "0"
 aws-sdk-polly = "0"
+aws-credential-types = {version = "0", features = ["hardcoded-credentials"]}
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
 regex = "1.7"

@@ -1,12 +1,13 @@
-use std::{fs, thread};
+use std::{fs, mem, thread};
 use std::path::PathBuf;
 use std::process::exit;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use eframe::Frame;
 use egui::{Context, FontData, FontDefinitions, FontFamily, ProgressBar, ScrollArea};
+use egui::panel::TopBottomSide;
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -31,10 +32,19 @@ async fn main() -> eframe::Result<()> {
     exit(0);
 }
 
+#[derive(Deserialize, Serialize, Default, Clone)]
+pub struct AwsKey {
+    access_key_id: String,
+    secret_access_key: String,
+}
+
 #[derive(Deserialize, Serialize)]
 struct App {
-    // only serde path, so the files_cache can be updated
     path: Option<PathBuf>,
+    aws_key: AwsKey,
+
+    #[serde(skip)]
+    temp_aws_key: AwsKey,
     #[serde(skip)]
     files_cache: Option<FilesCache>,
     #[serde(skip)]
@@ -45,19 +55,21 @@ struct App {
     chosen_file: Option<PathBuf>,
 
     #[serde(skip)]
-    sound: &'static str,
+    error_message: Arc<RwLock<String>>,
 }
 
 impl Default for App {
     fn default() -> Self {
         Self {
             path: None,
+            aws_key: AwsKey::default(),
+            temp_aws_key: AwsKey::default(),
             files_cache: None,
             /// 0 to 100
             play_progress: Arc::new(AtomicU8::new(0)),
             para: String::new(),
             chosen_file: None,
-            sound: "none",
+            error_message: Arc::new(RwLock::new(String::new())),
         }
     }
 }
@@ -88,8 +100,13 @@ impl App {
         }
     }
 
-    fn display_paragraph(&self) -> String {
-        self.para.clone()
+    fn display_content(&self) -> String {
+        let content = self.error_message.read().unwrap();
+        if !content.is_empty() {
+            content.to_string()
+        } else {
+            self.para.clone()
+        }
     }
 
     fn display_chosen_file(&self) -> String {
@@ -100,7 +117,7 @@ impl App {
     }
 
 
-    async fn play(path: PathBuf, progress: Arc<AtomicU8>) {
+    async fn play(path: PathBuf, progress: Arc<AtomicU8>, error_msg: Arc<RwLock<String>>, aws_key: AwsKey) {
         println!("{:?}", path);
         let paragraphs = paragraph::divide_note_content(&path);
         let para_len = paragraphs.len();
@@ -108,7 +125,7 @@ impl App {
         let (tx, mut rx) = mpsc::channel(2);
         tokio::spawn(async move {
             for p in paragraphs {
-                let processed = polly::process(p).await;
+                let processed = polly::process(p, &aws_key).await;
                 if (tx.send(processed).await).is_err() {
                     println!("receiver dropped");
                     return;
@@ -118,19 +135,67 @@ impl App {
 
         // update progress
         let mut played_count = 0u8;
-        while let Some(p) = rx.recv().await {
-            audio::play(p);
-            played_count += 1;
-            progress.store((played_count as usize * 100 / para_len) as u8, Ordering::Release);
-            println!("set progress to {}", (played_count as usize * 100 / para_len));
-            // sleep some seconds between paragraphs
-            thread::sleep(Duration::from_secs(1));
+        while let Some(r) = rx.recv().await {
+            match r {
+                Ok(radio) => {
+                    audio::play(radio);
+                    played_count += 1;
+                    progress.store((played_count as usize * 100 / para_len) as u8, Ordering::Release);
+                    println!("set progress to {}", (played_count as usize * 100 / para_len));
+                    // sleep some seconds between paragraphs
+                    thread::sleep(Duration::from_secs(1));
+                }
+                Err(e) => {
+                    error_msg.write().unwrap().push_str(&(e.to_string() + "\n"));
+                }
+            }
         }
+    }
+
+    fn is_aws_credential_valid(&self) -> bool {
+        !self.aws_key.access_key_id.is_empty() && !self.aws_key.secret_access_key.is_empty()
+    }
+
+    fn is_temp_aws_credential_valid(&self) -> bool {
+        !self.temp_aws_key.access_key_id.is_empty() && !self.temp_aws_key.secret_access_key.is_empty()
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &Context, _frame: &mut Frame) {
+        // menu bar, containing reset credential button
+        egui::TopBottomPanel::new(TopBottomSide::Top, "top").show(ctx, |ui| {
+            ui.menu_button("File", |ui| {
+                if ui.button("Reset aws credential").clicked() {
+                    self.aws_key = AwsKey::default();
+                    ui.close_menu();
+                }
+            });
+        });
+
+        // show aws credential input window if the credential is not properly set
+        if !self.is_aws_credential_valid() {
+            egui::Window::new("AWS credentials").show(ctx, |ui| {
+                ui.label("No stored credentials found, please input new one:");
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("access_key_id: ");
+                        ui.text_edit_singleline(&mut self.temp_aws_key.access_key_id);
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("secret_access_key: ");
+                        ui.text_edit_singleline(&mut self.temp_aws_key.secret_access_key);
+                    });
+
+                    if ui.button("save").clicked() && self.is_temp_aws_credential_valid() {
+                        self.aws_key = mem::take(&mut self.temp_aws_key);
+                    }
+                });
+            });
+        }
+
+        // the main content
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
@@ -147,6 +212,8 @@ impl eframe::App for App {
                     if ui.button("play").clicked() {
                         // reset progress to 0
                         self.play_progress.store(0, Ordering::Release);
+                        // reset content label
+                        self.error_message.write().unwrap().clear();
                         // random choose path and play
                         if self.files_cache.is_none() {
                             match &self.path {
@@ -163,8 +230,10 @@ impl eframe::App for App {
                             self.chosen_file = Some(path.clone());
                             self.para = fs::read_to_string(path.clone()).unwrap();
                             let progress = self.play_progress.clone();
+                            let aws_key = self.aws_key.clone();
+                            let error_msg = self.error_message.clone();
                             tokio::spawn(async {
-                                Self::play(path, progress).await;
+                                Self::play(path, progress, error_msg, aws_key).await;
                             });
                         }
                     };
@@ -182,7 +251,7 @@ impl eframe::App for App {
 
                 ScrollArea::both().auto_shrink([false; 2]).show(ui, |ui| {
                     ui.style_mut().wrap = Some(false);
-                    ui.label(self.display_paragraph())
+                    ui.label(self.display_content())
                 });
             })
         });
